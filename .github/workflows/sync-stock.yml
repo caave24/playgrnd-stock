@@ -1,0 +1,152 @@
+name: Sync Playgrnd Stock
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "*.png"
+      - "*.jpg"
+      - "*.jpeg"
+      - "*.webp"
+      - "*.gif"
+      - "*.avif"
+      - "*.bmp"
+      - "*.tif"
+      - "*.tiff"
+      - "*.mp4"
+      - "*.webm"
+      - "*.mov"
+      - "*.m4v"
+      - "*.avi"
+      - "*.mkv"
+
+permissions:
+  contents: write
+
+jobs:
+  sync-stock:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install FFmpeg
+        uses: FedericoCarboni/setup-ffmpeg@v3
+
+      - name: Prepare asset directories
+        run: mkdir -p static_images videos
+
+      - name: Move root images
+        shell: bash
+        run: |
+          set -e
+          shopt -s nullglob nocaseglob
+          for file in *.png *.jpg *.jpeg *.webp *.gif *.avif *.bmp *.tif *.tiff; do
+            [ -f "$file" ] || continue
+            mv "$file" "static_images/$file"
+          done
+
+      - name: Convert videos and move originals
+        shell: bash
+        run: |
+          set -e
+          shopt -s nullglob nocaseglob
+          for video in *.mp4 *.webm *.mov *.m4v *.avi *.mkv; do
+            [ -f "$video" ] || continue
+
+            filename="$(basename "$video")"
+            base="${filename%.*}"
+            gif="static_images/${base}.gif"
+            counter=1
+
+            while [ -e "$gif" ]; do
+              gif="static_images/${base}-${counter}.gif"
+              counter=$((counter + 1))
+            done
+
+            ffmpeg -y \
+              -i "$video" \
+              -vf "fps=15,scale='min(800,iw)':-1:flags=lanczos" \
+              -loop 0 \
+              "$gif"
+
+            mv "$video" "videos/$filename"
+          done
+
+      - name: Update index.html
+        shell: bash
+        run: |
+          set -e
+          python3 <<'PY'
+          from pathlib import Path
+          import html
+          import re
+
+          index = Path("index.html")
+          assets = Path("static_images")
+
+          text = index.read_text(encoding="utf-8")
+          start_marker = "<!-- PLAYGRND-STOCK:START -->"
+          end_marker = "<!-- PLAYGRND-STOCK:END -->"
+
+          if start_marker not in text or end_marker not in text:
+              raise SystemExit("Gallery markers are missing from index.html")
+
+          raw_base = "https://raw.githubusercontent.com/caave24/playgrnd-stock/refs/heads/main"
+          extensions = {
+              ".png", ".jpg", ".jpeg", ".webp", ".gif",
+              ".avif", ".bmp", ".tif", ".tiff"
+          }
+
+          files = sorted(
+              p for p in assets.iterdir()
+              if p.is_file() and p.suffix.lower() in extensions
+          )
+
+          blocks = []
+
+          for path in files:
+              filename = path.name
+              safe_name = html.escape(filename, quote=True)
+              raw_url = f"{raw_base}/static_images/{filename}"
+
+              block = (
+                  '    <div class="Cell -6of12 asset">\n'
+                  f'      <a class="asset-link" href="{raw_url}" download="{safe_name}" '
+                  f'title="Open/download {safe_name}">\n'
+                  "        <figure>\n"
+                  f'          <img src="{raw_url}" alt="{safe_name}" loading="lazy">\n'
+                  f"          <figcaption>{safe_name}</figcaption>\n"
+                  "        </figure>\n"
+                  "      </a>\n"
+                  "    </div>"
+              )
+              blocks.append(block)
+
+          gallery = "\n".join(blocks)
+          replacement = f"{start_marker}\n{gallery}\n{end_marker}"
+
+          pattern = re.escape(start_marker) + r".*?" + re.escape(end_marker)
+          text = re.sub(pattern, replacement, text, flags=re.DOTALL)
+
+          index.write_text(text, encoding="utf-8")
+          print(f"Indexed {len(files)} image/GIF asset(s).")
+          PY
+
+      - name: Commit synchronized assets
+        shell: bash
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add static_images videos index.html
+
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+            exit 0
+          fi
+
+          git commit -m "Sync playgrnd stock assets"
+          git push
