@@ -4,253 +4,149 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - '*.[Pp][Nn][Gg]'
-      - '*.[Jj][Pp][Gg]'
-      - '*.[Jj][Pp][Ee][Gg]'
-      - '*.[Ww][Ee][Bb][Pp]'
-      - '*.[Gg][Ii][Ff]'
-      - '*.[Aa][Vv][Ii][Ff]'
-      - '*.[Bb][Mm][Pp]'
-      - '*.[Tt][Ii][Ff]'
-      - '*.[Tt][Ii][Ff][Ff]'
-      - '*.[Mm][Pp]4'
-      - '*.[Ww][Ee][Bb][Mm]'
-      - '*.[Mm][Oo][Vv]'
-      - '*.[Mm]4[Vv]'
-      - '*.[Aa][Vv][Ii]'
-      - '*.[Mm][Kk][Vv]'
+      - "*.png"
+      - "*.jpg"
+      - "*.jpeg"
+      - "*.webp"
+      - "*.gif"
+      - "*.avif"
+      - "*.bmp"
+      - "*.tif"
+      - "*.tiff"
+      - "*.mp4"
+      - "*.webm"
+      - "*.mov"
+      - "*.m4v"
+      - "*.avi"
+      - "*.mkv"
 
 permissions:
   contents: write
 
 jobs:
-  sync:
+  sync-stock:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Install media tools
+      - name: Install FFmpeg
         uses: FedericoCarboni/setup-ffmpeg@v3
 
-      - name: Process root media
+      - name: Prepare asset directories
+        run: mkdir -p static_images videos
+
+      - name: Move root images
         shell: bash
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          BEFORE_SHA: ${{ github.event.before }}
-          AFTER_SHA: ${{ github.sha }}
         run: |
-          set -euo pipefail
+          set -e
           shopt -s nullglob nocaseglob
-          mkdir -p static_images videos
-
-          is_image() {
-            case "$1" in
-              *.png|*.jpg|*.jpeg|*.webp|*.gif|*.avif|*.bmp|*.tif|*.tiff) return 0 ;;
-              *) return 1 ;;
-            esac
-          }
-
-          is_video() {
-            case "$1" in
-              *.mp4|*.webm|*.mov|*.m4v|*.avi|*.mkv) return 0 ;;
-              *) return 1 ;;
-            esac
-          }
-
-          files=()
-
-          # Push: process only root-level media changed by this push.
-          # Manual run: process everything still in the root inbox.
-          if [[ "$EVENT_NAME" == "workflow_dispatch" || "$BEFORE_SHA" =~ ^0+$ ]]; then
-            for file in *; do
-              [[ -f "$file" ]] || continue
-              if is_image "$file" || is_video "$file"; then
-                files+=("$file")
-              fi
-            done
-          else
-            while IFS= read -r -d '' file; do
-              [[ "$file" != */* ]] || continue
-              [[ -f "$file" ]] || continue
-              if is_image "$file" || is_video "$file"; then
-                files+=("$file")
-              fi
-            done < <(git diff --name-only -z "$BEFORE_SHA" "$AFTER_SHA" --)
-          fi
-
-          for file in "${files[@]}"; do
-            [[ -f "$file" ]] || continue
-            echo "::group::Processing $file"
-
-            filename="$(basename "$file")"
-            stem="${filename%.*}"
-            ext="${filename##*.}"
-            hash="$(sha256sum "$file" | cut -c1-8)"
-
-            if is_image "$file"; then
-              destination="static_images/${stem}-${hash}.${ext}"
-
-              if [[ -e "$destination" ]]; then
-                if cmp -s "$file" "$destination"; then
-                  rm -f -- "$file"
-                  echo "Identical image already exists; removed root duplicate."
-                else
-                  echo "ERROR: Image destination collision: $destination"
-                  exit 1
-                fi
-              else
-                cp -p -- "$file" "$destination"
-                rm -f -- "$file"
-                echo "Stored full-resolution image: $destination"
-              fi
-
-              echo "::endgroup::"
-              continue
-            fi
-
-            video_destination="videos/${stem}-${hash}.${ext}"
-            gif_destination="static_images/${stem}-${hash}.gif"
-
-            video_exists=false
-            gif_exists=false
-            [[ -e "$video_destination" ]] && video_exists=true
-            [[ -e "$gif_destination" ]] && gif_exists=true
-
-            # Check existing outputs BEFORE FFmpeg.
-            if $video_exists && $gif_exists; then
-              if ! cmp -s "$file" "$video_destination"; then
-                echo "ERROR: Existing video differs: $video_destination"
-                exit 1
-              fi
-              rm -f -- "$file"
-              echo "Video + GIF already exist. Skipping FFmpeg."
-              echo "::endgroup::"
-              continue
-            fi
-
-            # Original exists, GIF missing: generate only the GIF.
-            if $video_exists && ! $gif_exists; then
-              if ! cmp -s "$file" "$video_destination"; then
-                echo "ERROR: Existing video differs: $video_destination"
-                exit 1
-              fi
-
-              tmp_gif="$(mktemp --suffix=.gif)"
-              if ffmpeg -hide_banner -loglevel error -y \
-                  -i "$file" \
-                  -vf "fps=12,scale=800:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128:stats_mode=diff[p];[s1][p]paletteuse=dither=sierra2_4a" \
-                  -loop 0 "$tmp_gif"; then
-                mv -- "$tmp_gif" "$gif_destination"
-                rm -f -- "$file"
-                echo "Generated missing GIF: $gif_destination"
-              else
-                rm -f -- "$tmp_gif"
-                echo "FFmpeg failed; original remains in root: $file"
-              fi
-
-              echo "::endgroup::"
-              continue
-            fi
-
-            # GIF exists, original missing: reuse GIF and store original.
-            if ! $video_exists && $gif_exists; then
-              cp -p -- "$file" "$video_destination"
-              rm -f -- "$file"
-              echo "Reused existing GIF; stored original: $video_destination"
-              echo "::endgroup::"
-              continue
-            fi
-
-            # Neither output exists: create GIF, then move original only after success.
-            tmp_gif="$(mktemp --suffix=.gif)"
-            if ffmpeg -hide_banner -loglevel error -y \
-                -i "$file" \
-                -vf "fps=12,scale=800:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128:stats_mode=diff[p];[s1][p]paletteuse=dither=sierra2_4a" \
-                -loop 0 "$tmp_gif"; then
-              mv -- "$tmp_gif" "$gif_destination"
-              cp -p -- "$file" "$video_destination"
-              rm -f -- "$file"
-              echo "Stored original: $video_destination"
-              echo "Generated GIF: $gif_destination"
-            else
-              rm -f -- "$tmp_gif"
-              echo "FFmpeg failed; original remains in root: $file"
-            fi
-
-            echo "::endgroup::"
+          for file in *.png *.jpg *.jpeg *.webp *.gif *.avif *.bmp *.tif *.tiff; do
+            [ -f "$file" ] || continue
+            mv "$file" "static_images/$file"
           done
 
-      - name: Rebuild gallery index
-        shell: python
-        run: |
-          from pathlib import Path
-          from urllib.parse import quote
-
-          image_dir = Path("static_images")
-          video_dir = Path("videos")
-          image_exts = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".bmp", ".tif", ".tiff"}
-          video_exts = {".mp4", ".webm", ".mov", ".m4v", ".avi", ".mkv"}
-
-          videos = {
-              p.stem: p for p in video_dir.iterdir()
-              if p.is_file() and p.suffix.lower() in video_exts
-          }
-
-          items = []
-          for p in sorted(image_dir.iterdir(), key=lambda x: x.name.lower()):
-              if not p.is_file() or p.suffix.lower() not in image_exts:
-                  continue
-
-              video = videos.get(p.stem)
-              if p.suffix.lower() == ".gif" and video:
-                  href = "videos/" + quote(video.name)
-              else:
-                  href = "static_images/" + quote(p.name)
-
-              items.append(
-                  '<a class="Cell -6of12" href="' + href + '" target="_blank" rel="noopener">'
-                  '<img src="static_images/' + quote(p.name) + '" alt="' + p.name + '" loading="lazy">'
-                  '</a>'
-              )
-
-          html = """<!doctype html>
-          <html lang="en">
-          <head>
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <title>playgrnd stock</title>
-            <link rel="stylesheet" href="grd.css">
-            <style>
-              body { margin: 0; padding: 1rem; }
-              img { display: block; width: 100%; height: auto; }
-              a { text-decoration: none; }
-            </style>
-          </head>
-          <body>
-            <main class="Grid">
-          """ + "\n".join(items) + """
-            </main>
-          </body>
-          </html>
-          """
-
-          Path("index.html").write_text(html, encoding="utf-8")
-
-      - name: Commit processed media
+      - name: Convert videos and move originals
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
+          shopt -s nullglob nocaseglob
+          for video in *.mp4 *.webm *.mov *.m4v *.avi *.mkv; do
+            [ -f "$video" ] || continue
+
+            filename="$(basename "$video")"
+            base="${filename%.*}"
+            gif="static_images/${base}.gif"
+            counter=1
+
+            while [ -e "$gif" ]; do
+              gif="static_images/${base}-${counter}.gif"
+              counter=$((counter + 1))
+            done
+
+            ffmpeg -y \
+              -i "$video" \
+              -vf "fps=15,scale='min(800,iw)':-1:flags=lanczos" \
+              -loop 0 \
+              "$gif"
+
+            mv "$video" "videos/$filename"
+          done
+
+      - name: Update index.html
+        shell: bash
+        run: |
+          set -e
+          python3 <<'PY'
+          from pathlib import Path
+          import html
+          import re
+
+          index = Path("index.html")
+          assets = Path("static_images")
+
+          text = index.read_text(encoding="utf-8")
+          start_marker = "<!-- PLAYGRND-STOCK:START -->"
+          end_marker = "<!-- PLAYGRND-STOCK:END -->"
+
+          if start_marker not in text or end_marker not in text:
+              raise SystemExit("Gallery markers are missing from index.html")
+
+          raw_base = "https://raw.githubusercontent.com/caave24/playgrnd-stock/refs/heads/main"
+          extensions = {
+              ".png", ".jpg", ".jpeg", ".webp", ".gif",
+              ".avif", ".bmp", ".tif", ".tiff"
+          }
+
+          files = sorted(
+              p for p in assets.iterdir()
+              if p.is_file() and p.suffix.lower() in extensions
+          )
+
+          blocks = []
+
+          for path in files:
+              filename = path.name
+              safe_name = html.escape(filename, quote=True)
+              raw_url = f"{raw_base}/static_images/{filename}"
+
+              block = (
+                  '    <div class="Cell -6of12 asset">\n'
+                  f'      <a class="asset-link" href="{raw_url}" download="{safe_name}" '
+                  f'title="Open/download {safe_name}">\n'
+                  "        <figure>\n"
+                  f'          <img src="{raw_url}" alt="{safe_name}" loading="lazy">\n'
+                  f"          <figcaption>{safe_name}</figcaption>\n"
+                  "        </figure>\n"
+                  "      </a>\n"
+                  "    </div>"
+              )
+              blocks.append(block)
+
+          gallery = "\n".join(blocks)
+          replacement = f"{start_marker}\n{gallery}\n{end_marker}"
+
+          pattern = re.escape(start_marker) + r".*?" + re.escape(end_marker)
+          text = re.sub(pattern, replacement, text, flags=re.DOTALL)
+
+          index.write_text(text, encoding="utf-8")
+          print(f"Indexed {len(files)} image/GIF asset(s).")
+          PY
+
+      - name: Commit synchronized assets
+        shell: bash
+        run: |
+          set -e
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A static_images videos index.html
+
+          git add static_images videos index.html
 
           if git diff --cached --quiet; then
-            echo "No changes to commit."
+            echo "Nothing to commit."
             exit 0
           fi
 
-          git commit -m "Sync stock media"
+          git commit -m "Sync playgrnd stock assets"
           git push
